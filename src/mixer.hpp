@@ -53,6 +53,14 @@ private:
 	UINT64 timeline_frames = 0;
 	std::vector<float> mix;
 
+	// Diagnostic counters; accessed only by the mixer worker thread.
+	UINT64 diagnostic_last_report = 0;
+	UINT64 diagnostic_ticks = 0;
+	UINT64 diagnostic_input_packets = 0;
+	UINT64 diagnostic_output_calls = 0;
+	UINT64 diagnostic_output_frames = 0;
+	UINT64 diagnostic_max_output_duration = 0;
+
 	UINT64 GetCurrentTimestamp();
 	std::size_t DurationToFrames(UINT64 duration);
 	UINT64 FramesToDuration(std::size_t frames);

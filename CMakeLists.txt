@@ -129,6 +129,7 @@ configure_file(
 
 add_library(win-capture-audio MODULE
     src/plugin.cpp
+    src/diagnostics.cpp
     src/audio-capture.cpp
     src/audio-capture-helper.cpp
     src/session-monitor.cpp

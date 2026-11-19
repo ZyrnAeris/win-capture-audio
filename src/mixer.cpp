@@ -10,6 +10,7 @@
 #include <avrt.h>
 #include <winbase.h>
 #include <winuser.h>
+#include "diagnostics.hpp"
 
 UINT64 Mixer::GetCurrentTimestamp()
 {
@@ -104,6 +105,7 @@ void Mixer::ProcessInput()
 	while (input_queue.size() > 0) {
 		auto &[input_timestamp, input_buffer] = input_queue.front();
 		ProcessInput(input_timestamp, input_buffer);
+		++diagnostic_input_packets;
 		input_queue.pop();
 	}
 }
@@ -136,12 +138,39 @@ std::tuple<std::size_t, std::size_t> Mixer::CalculateCutoff(UINT64 timestamp)
 
 void Mixer::Tick()
 {
+	++diagnostic_ticks;
 	ProcessInput();
+
+	const UINT64 current_timestamp = GetCurrentTimestamp();
+
+	// Report once every 10 seconds. Timestamps use 100ns units.
+	if (diagnostic_last_report == 0)
+		diagnostic_last_report = current_timestamp;
+
+	if (current_timestamp - diagnostic_last_report >= 100000000ULL) {
+		diagnostic_log(
+			"mixer.stats",
+			"mixer=%p ticks=%llu input_packets=%llu output_calls=%llu "
+			"output_frames=%llu max_output_us=%llu mix_samples=%zu",
+			static_cast<void *>(this),
+			static_cast<unsigned long long>(diagnostic_ticks),
+			static_cast<unsigned long long>(diagnostic_input_packets),
+			static_cast<unsigned long long>(diagnostic_output_calls),
+			static_cast<unsigned long long>(diagnostic_output_frames),
+			static_cast<unsigned long long>(diagnostic_max_output_duration / 10),
+			mix.size());
+
+		diagnostic_last_report = current_timestamp;
+		diagnostic_ticks = 0;
+		diagnostic_input_packets = 0;
+		diagnostic_output_calls = 0;
+		diagnostic_output_frames = 0;
+		diagnostic_max_output_duration = 0;
+	}
 
 	if (mix.size() == 0)
 		return;
 
-	UINT64 current_timestamp = GetCurrentTimestamp();
 	auto [start, end] = CalculateCutoff(current_timestamp);
 
 	if (start * format.nChannels >= mix.size()) {
@@ -165,7 +194,16 @@ void Mixer::Tick()
 	};
 
 	obs_packet.data[0] = reinterpret_cast<BYTE *>(mix.data() + start * format.nChannels);
+
+	const UINT64 output_start = GetCurrentTimestamp();
 	obs_source_output_audio(source, &obs_packet);
+	const UINT64 output_duration = GetCurrentTimestamp() - output_start;
+
+	++diagnostic_output_calls;
+	diagnostic_output_frames += obs_packet.frames;
+
+	if (output_duration > diagnostic_max_output_duration)
+		diagnostic_max_output_duration = output_duration;
 
 	// Drop the consumed head in place; the old code allocated a fresh vector
 	// on every tick (100x per second).
@@ -177,6 +215,13 @@ void Mixer::Tick()
 
 void Mixer::Run()
 {
+	diagnostic_log(
+		"mixer.worker_start",
+		"mixer=%p source=%p thread_id=%lu",
+		static_cast<void *>(this),
+		static_cast<void *>(source),
+		GetCurrentThreadId());
+
 	// Register with the multimedia scheduler: the 10ms tick has to hold its
 	// deadline under CPU contention or the output stutters (see also the
 	// THREAD_PRIORITY_HIGHEST fallback set by the constructor). Thread exit
@@ -210,6 +255,12 @@ void Mixer::Run()
 			break;
 		}
 	}
+
+	diagnostic_log(
+		"mixer.worker_exit",
+		"mixer=%p thread_id=%lu",
+		static_cast<void *>(this),
+		GetCurrentThreadId());
 }
 
 void Mixer::SubmitPacket(UINT64 timestamp, float *data, UINT32 num_frames)
@@ -238,14 +289,40 @@ Mixer::Mixer(obs_source_t *source, WAVEFORMATEX format) : source{source}, format
 				   reinterpret_cast<void *>(static_cast<uintptr_t>(worker_tid)),
 				   tick_interval, tick_interval, WT_EXECUTEINTIMERTHREAD))
 		error("failed to create tick timer (%lu)", GetLastError());
+
+	diagnostic_log(
+		"mixer.create",
+		"mixer=%p source=%p worker_tid=%lu timer=%p "
+		"sample_rate=%lu channels=%u bits=%u",
+		static_cast<void *>(this),
+		static_cast<void *>(source),
+		worker_tid,
+		static_cast<void *>(timer),
+		format.nSamplesPerSec,
+		format.nChannels,
+		format.wBitsPerSample);
 }
 
 Mixer::~Mixer()
 {
+	diagnostic_log(
+		"mixer.destroy_begin",
+		"mixer=%p source=%p worker_tid=%lu timer=%p",
+		static_cast<void *>(this),
+		static_cast<void *>(source),
+		worker_tid,
+		static_cast<void *>(timer));
+
 	if (timer && !DeleteTimerQueueTimer(NULL, timer, INVALID_HANDLE_VALUE))
 		warn("DeleteTimerQueueTimer failed (%lu)", GetLastError());
 
 	worker_ready.wait();
 	PostThreadMessageW(worker_tid, MixerEvents::Shutdown, NULL, NULL);
 	worker_thread.join();
+
+	diagnostic_log(
+		"mixer.destroy_complete",
+		"mixer=%p source=%p",
+		static_cast<void *>(this),
+		static_cast<void *>(source));
 }
